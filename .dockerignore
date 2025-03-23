@@ -1,0 +1,21 @@
+# Ignorar archivos de entorno
+.env
+*.env
+
+# Ignorar dependencias locales
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Ignorar configuraciones de desarrollo
+.vscode/
+.idea/
+*.iml
+
+# Archivos innecesarios
+.git
+.gitignore
+docker-compose.override.yml
+docker-compose.override.yaml
