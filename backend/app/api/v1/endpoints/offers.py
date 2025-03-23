@@ -1,8 +1,9 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Query, BackgroundTasks
+from fastapi import APIRouter, Body, Depends, HTTPException, status, Query, BackgroundTasks
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from typing import Any, List, Optional
 from datetime import datetime, timedelta, timezone
+from app.core.utils import normalize_datetime_comparison 
 import uuid
 import logging
 
@@ -13,6 +14,28 @@ from app.models.product import Product
 from app.models.user import User
 from app.websockets.connection import manager
 from app.core.config import settings
+from sqlalchemy.exc import IntegrityError
+from contextlib import contextmanager
+@contextmanager
+def transaction_scope(db: Session):
+    """Proporciona un contexto transaccional."""
+    try:
+        yield
+        db.commit()
+    except IntegrityError as e:
+        db.rollback()
+        logger.error(f"Error de integridad en transacción: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Error de integridad en la operación. Por favor, inténtalo de nuevo."
+        )
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error en transacción: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error interno del servidor durante la transacción"
+        )
 
 logger = logging.getLogger(__name__)
 
@@ -224,7 +247,17 @@ async def update_offer_status_via_body(
 ) -> Any:
     """
     Actualizar el estado de una oferta (aceptar o rechazar) con control de concurrencia optimista.
-    Este endpoint utiliza el cuerpo de la petición en lugar de query parameters.
+    Este endpoint requiere un cuerpo JSON con:
+    - status: "accepted" o "rejected"
+    - version: número de versión actual de la oferta
+
+    Ejemplo:
+    ```
+    {
+        "status": "accepted",
+        "version": 1
+    }
+    ```
     """
     # Extraer status y version del cuerpo del request
     status_value = offer_update.status
@@ -266,22 +299,16 @@ async def update_offer_status_via_body(
             detail=f"No se puede actualizar una oferta con estado '{offer.status}'",
         )
     
-    now = datetime.now()
+    now = datetime.now(timezone.utc)  # Usar siempre UTC para el tiempo actual
     expires_at = offer.expires_at
-    
-    # Si expires_at tiene zona horaria pero now no, convertir now a aware
-    if expires_at.tzinfo is not None and now.tzinfo is None:
-        # Convertir a aware usando la misma zona horaria que expires_at
-        now = now.replace(tzinfo=expires_at.tzinfo)
-    # Si now tiene zona horaria pero expires_at no, convertir expires_at a aware
-    elif now.tzinfo is not None and expires_at.tzinfo is None:
-        # Convertir a aware usando la misma zona horaria que now
-        expires_at = expires_at.replace(tzinfo=now.tzinfo)
-    
+
+    # Normalizar las fechas para comparación
+    now, expires_at = normalize_datetime_comparison(now, expires_at)
+
     if expires_at < now:
         # Actualizar a expirada
         offer.status = "expired"
-        offer.updated_at = datetime.now()
+        offer.updated_at = datetime.now(timezone.utc)  # Usar siempre UTC
         offer.version += 1
         db.add(offer)
         db.commit()
@@ -292,18 +319,30 @@ async def update_offer_status_via_body(
         )
     
     try:
-        # Actualizar el estado de la oferta
-        offer.status = status_value
-        offer.updated_at = datetime.now()
-        offer.version += 1
-        
-        # Si la oferta fue aceptada, marcar el producto como vendido
-        product = None
-        other_offers = []
-        
-        if status_value == "accepted":
-            product = db.query(Product).filter(Product.id == offer.product_id).with_for_update().first()
-            if product:
+        # Usar un contexto de transacción explícito
+        with transaction_scope(db):
+            # Actualizar el estado de la oferta
+            offer.status = status_value
+            offer.updated_at = datetime.now(timezone.utc)  # Usar UTC
+            offer.version += 1
+            db.add(offer)
+            
+            # Si la oferta fue aceptada, marcar el producto como vendido
+            product = None
+            other_offers = []
+            
+            if status_value == "accepted":
+                # Siempre usar with_for_update() para bloqueo
+                product = db.query(Product).filter(
+                    Product.id == offer.product_id
+                ).with_for_update().first()
+                
+                if not product:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="Producto no encontrado"
+                    )
+                    
                 # Verificar que el producto siga disponible
                 if product.status != "active":
                     raise HTTPException(
@@ -314,23 +353,22 @@ async def update_offer_status_via_body(
                 # Marcar como vendido
                 product.status = "sold"
                 db.add(product)
-            
-            # Obtener otras ofertas pendientes para rechazarlas
-            other_offers = db.query(Offer).filter(
-                Offer.product_id == offer.product_id,
-                Offer.id != offer_id,
-                Offer.status == "pending"
-            ).all()
-            
-            # Rechazar otras ofertas
-            for other_offer in other_offers:
-                other_offer.status = "rejected"
-                other_offer.updated_at = datetime.now()
-                other_offer.version += 1
-                db.add(other_offer)
+                
+                # Obtener otras ofertas pendientes para rechazarlas
+                other_offers = db.query(Offer).filter(
+                    Offer.product_id == offer.product_id,
+                    Offer.id != offer_id,
+                    Offer.status == "pending"
+                ).with_for_update().all()  # Usar with_for_update() aquí también
+                
+                # Rechazar otras ofertas
+                for other_offer in other_offers:
+                    other_offer.status = "rejected"
+                    other_offer.updated_at = datetime.now(timezone.utc)  # Usar UTC
+                    other_offer.version += 1
+                    db.add(other_offer)
         
-        db.add(offer)
-        db.commit()
+        # Refrescar oferta fuera de la transacción
         db.refresh(offer)
         
         # Notificar al comprador sobre la actualización (en segundo plano)
@@ -429,13 +467,31 @@ async def cancel_offer(
     *,
     db: Session = Depends(deps.get_db),
     offer_id: str,
-    version: int = Query(..., description="Versión actual de la oferta"),
+    cancel_data: dict = Body(..., description="Datos para cancelar la oferta", 
+                           example={"version": 1}),
     current_user: User = Depends(deps.get_current_user),
     background_tasks: BackgroundTasks,
 ):
     """
     Cancelar una oferta realizada (solo el comprador puede cancelar).
+    Requiere un cuerpo JSON con:
+    - version: número de versión actual de la oferta
+
+    Ejemplo:
+    ```
+    {
+        "version": 1
+    }
+    ```
     """
+    # Extraer versión del cuerpo del request
+    version = cancel_data.get("version")
+    if not version:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="El campo 'version' es requerido",
+        )
+    
     # Obtener la oferta con bloqueo pesimista
     offer = db.query(Offer).filter(Offer.id == offer_id).with_for_update().first()
     if not offer:

@@ -35,10 +35,43 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
         user_id = user_data["user_id"]
         
         # Aceptar conexión
-        await manager.connect(websocket, user_id)
+        connection_result = await manager.connect(websocket, user_id)
+        if not connection_result:
+            # Si la conexión falló pero websocket aún está abierto
+            try:
+                await websocket.send_json({
+                    "type": "error",
+                    "action": "connection_failed",
+                    "data": {
+                        "message": "Error al establecer la conexión",
+                        "retry": True
+                    }
+                })
+                # No cerramos aquí, permitimos que la excepción normal cierre
+            except:
+                pass
+            return
         
         # Enviar mensajes pendientes al usuario que acaba de conectarse
         pending_messages = await manager.get_pending_messages(user_id)
+        if pending_messages:
+            for message in pending_messages:
+                try:
+                    await websocket.send_json(message)
+                    # Pequeña pausa para no saturar la conexión
+                    await asyncio.sleep(0.01)
+                except Exception as e:
+                    logger.warning(f"Error enviando mensaje pendiente: {e}")
+            
+            # Confirmar recepción de mensajes pendientes
+            await websocket.send_json({
+                "type": "system",
+                "action": "pending_delivered",
+                "data": {
+                    "count": len(pending_messages),
+                    "message": f"Se entregaron {len(pending_messages)} mensajes pendientes"
+                }
+            })
         for message in pending_messages:
             await websocket.send_json(message)
             

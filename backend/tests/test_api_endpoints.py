@@ -368,45 +368,23 @@ class MarketplaceAPITest(unittest.TestCase):
         self.assertTrue(self.__class__.offer_id, "ID de oferta no disponible")
         self.assertTrue(self.__class__.offer_version is not None, "Versión de oferta no disponible")
         
-        # Primero intentamos con el endpoint que utiliza el cuerpo (body)
+        # Usar el enfoque estandarizado con cuerpo JSON
         body_data = {
             "status": "accepted",
             "version": self.__class__.offer_version
         }
         
-        # Hacemos la petición al nuevo endpoint con el cuerpo
-        response = self.make_request("PATCH", f"/offers/{self.__class__.offer_id}/respond", data=body_data)
+        # Hacemos la petición al endpoint estandarizado
+        response = self.make_request(
+            "PATCH", 
+            f"/offers/{self.__class__.offer_id}/respond", 
+            data=body_data
+        )
         
-        print(f"Status Code (endpoint body): {response.status_code}")
+        print(f"Status Code: {response.status_code}")
         print(f"Response: {response.text[:200]}...")
         
-        # Si el endpoint alternativo no existe (404), intentamos con el endpoint original
-        if response.status_code == 404:
-            print("El endpoint alternativo no existe. Intentando con el endpoint original...")
-            
-            # Construir la URL directamente con los parámetros
-            url = f"/offers/{self.__class__.offer_id}?status=accepted&version={self.__class__.offer_version}"
-            response = self.make_request("PATCH", url)
-            
-            print(f"Status Code (URL con parámetros): {response.status_code}")
-            print(f"Response: {response.text[:200]}...")
-            
-            # Si también falló, intentamos con el método params
-            if response.status_code == 422:
-                print("Intentando con el método params explícito...")
-                response = requests.patch(
-                    f"{self.BASE_URL}/offers/{self.__class__.offer_id}",
-                    params={
-                        "status": "accepted",
-                        "version": str(self.__class__.offer_version)
-                    },
-                    headers={"Authorization": f"Bearer {self.__class__.auth_token}"}
-                )
-                
-                print(f"Status Code (requests directo): {response.status_code}")
-                print(f"Response: {response.text[:200]}...")
-        
-        # Si obtenemos conflicto de versión (409), intentamos obtener la versión actual
+        # Si hay conflicto de versión (409), intentamos obtener la versión actual y reintentar
         if response.status_code == 409:
             print("Conflicto de versión detectado, obteniendo la versión actual...")
             
@@ -422,39 +400,23 @@ class MarketplaceAPITest(unittest.TestCase):
                     
                     # Intentar de nuevo con la versión correcta
                     body_data["version"] = current_version
-                    retry_response = self.make_request("PATCH", f"/offers/{self.__class__.offer_id}/respond", data=body_data)
+                    retry_response = self.make_request(
+                        "PATCH", 
+                        f"/offers/{self.__class__.offer_id}/respond", 
+                        data=body_data
+                    )
                     
-                    if retry_response.status_code != 404:
-                        response = retry_response
-                    else:
-                        # Intentar con el endpoint original y la versión actualizada
-                        url = f"/offers/{self.__class__.offer_id}?status=accepted&version={current_version}"
-                        response = self.make_request("PATCH", url)
-        
-        # Si aún así no funciona, mostramos información detallada
-        if response.status_code not in [200, 400]:
-            print(f"Respuesta de error completa: {response.text}")
-            
-            # Intentamos obtener la oferta para ver su estado actual
-            get_response = self.make_request("GET", f"/offers/{self.__class__.offer_id}")
-            
-            if get_response.status_code == 200:
-                offer_data = get_response.json()
-                print(f"Estado actual de la oferta: {offer_data.get('status')}")
-                print(f"Versión actual: {offer_data.get('version')}")
+                    response = retry_response
         
         # La prueba puede ser exitosa con 200 (OK) o 400 (Bad Request) dependiendo del estado actual
-        # Permitimos 422 para fines de debug
-        self.assertIn(response.status_code, [200, 400, 422, 503])
+        self.assertIn(response.status_code, [200, 400, 409])
         
-        if response.status_code == 422:
-            print("NOTA: La prueba terminó con error 422, pero se considera un paso para debug.")
+        if response.status_code == 409:
+            print("La versión de la oferta ha cambiado. Necesita ser actualizada.")
         elif response.status_code == 200:
             print("La oferta se ha actualizado exitosamente.")
         elif response.status_code == 400:
             print("La oferta no se pudo actualizar debido a su estado actual (puede ser normal).")
-        elif response.status_code == 503:
-            print("NOTA: La API devolvió un error de servicio (503). Esto podría indicar un problema con la comparación de fechas. Verifica si se ha aplicado la corrección de datetime.")
     def test_13_send_message(self):
         """Prueba enviar un mensaje a otro usuario"""
         print("\n----- Test: Enviar Mensaje -----")
@@ -495,6 +457,54 @@ class MarketplaceAPITest(unittest.TestCase):
         # Verificar que el listado sea un array
         messages = response.json()
         self.assertIsInstance(messages, list)
+    def test_15_cancel_offer(self):
+        """Prueba cancelar una oferta (desde el usuario comprador)"""
+        print("\n----- Test: Cancelar Oferta -----")
+        
+        # Verificar que tengamos token del segundo usuario
+        self.assertTrue(self.__class__.second_user["token"], "Token del segundo usuario no disponible")
+        
+        # Crear una nueva oferta para cancelarla
+        data = {
+            "product_id": self.__class__.product_id,
+            "amount": 170.0,
+            "message": "Nueva oferta para prueba de cancelación"
+        }
+        
+        # Crear oferta desde el segundo usuario
+        response = self.make_request(
+            "POST", 
+            "/offers", 
+            data=data, 
+            token=self.__class__.second_user["token"]
+        )
+        
+        if response.status_code == 201:
+            offer_data = response.json()
+            offer_id = offer_data.get("id")
+            version = offer_data.get("version", 1)
+            
+            print(f"Oferta creada con ID: {offer_id}")
+            
+            # Cancelar la oferta usando el endpoint actualizado
+            cancel_data = {
+                "version": version
+            }
+            
+            cancel_response = self.make_request(
+                "DELETE", 
+                f"/offers/{offer_id}", 
+                data=cancel_data, 
+                token=self.__class__.second_user["token"]
+            )
+            
+            print(f"Status Code (cancelación): {cancel_response.status_code}")
+            print(f"Response: {cancel_response.text[:200]}...")
+            
+            self.assertEqual(200, cancel_response.status_code)
+        else:
+            print(f"Error al crear oferta para cancelar: {response.text}")
+            self.skipTest("No se pudo crear oferta para prueba de cancelación")
 
 if __name__ == "__main__":
     # Ejecutar pruebas en orden

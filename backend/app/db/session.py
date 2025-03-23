@@ -49,18 +49,18 @@ async def init_db_connection(max_retries=5, initial_delay=1):
         
         while retry_count < max_retries:
             try:
-                # Crear motor asíncrono
+                # Crear motor asíncrono con opciones más robustas pero sin connect_args
                 engine = create_async_engine(
                     get_async_db_url(settings.DATABASE_URL),
                     echo=settings.DEBUG,
-                    pool_size=5,
-                    max_overflow=10,
-                    pool_timeout=30,
-                    pool_recycle=3600,
-                    pool_pre_ping=True,
+                    pool_size=10,  # Aumentar pool size
+                    max_overflow=20,  # Aumentar overflow
+                    pool_timeout=60,  # Aumentar timeout
+                    pool_recycle=1800,  # Reciclar conexiones cada 30 minutos
+                    pool_pre_ping=True,  # Verificar conexiones
                 )
                 
-                # Probar la conexión - USAR TEXT()
+                # Probar la conexión
                 async with engine.begin() as conn:
                     await conn.execute(text("SELECT 1"))
                 
@@ -81,12 +81,13 @@ async def init_db_connection(max_retries=5, initial_delay=1):
                 
                 sync_engine = create_engine(
                     str(settings.DATABASE_URL),
-                    pool_size=5,
-                    max_overflow=10,
-                    pool_timeout=30,
-                    pool_recycle=3600,
+                    pool_size=10,
+                    max_overflow=20,
+                    pool_timeout=60,
+                    pool_recycle=1800,
                     pool_pre_ping=True,
                     echo=settings.DEBUG,
+                    # Eliminar connect_args que estaba causando el error
                 )
                 
                 SessionLocal = sync_sessionmaker(
@@ -95,7 +96,7 @@ async def init_db_connection(max_retries=5, initial_delay=1):
                     bind=sync_engine
                 )
                 
-                # Probar que la sesión sincrónica funciona - USAR TEXT()
+                # Probar que la sesión sincrónica funciona
                 test_session = SessionLocal()
                 test_session.execute(text("SELECT 1"))
                 test_session.close()
@@ -116,8 +117,7 @@ async def init_db_connection(max_retries=5, initial_delay=1):
                 await asyncio.sleep(wait_time)
         
         logger.error(f"No se pudo conectar a la base de datos después de {max_retries} intentos: {last_exception}")
-        return False
-
+        return False   
 # Dependencia para obtener una sesión de base de datos asíncrona
 async def get_async_db():
     """

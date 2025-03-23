@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
 from sqlalchemy import select, update, and_
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -32,7 +32,7 @@ async def expire_offers() -> List[Dict[str, Any]]:
             logger.error("No se pudo inicializar AsyncSessionLocal")
             return []
     
-    now = datetime.now()
+    now = datetime.now(timezone.utc) 
     expired_offers = []
     
     async with AsyncSessionLocal() as session:

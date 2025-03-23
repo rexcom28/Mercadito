@@ -1,3 +1,4 @@
+import uuid
 from fastapi import WebSocket, WebSocketDisconnect, HTTPException, status
 import json
 import logging
@@ -6,7 +7,7 @@ import asyncio
 import redis.asyncio as redis
 from app.core.config import settings
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,15 @@ class ConnectionManager:
         try:
             await websocket.accept()
             
+            # Si hay una conexión existente, cerrarla para evitar duplicados
+            if user_id in self.active_connections:
+                try:
+                    old_ws = self.active_connections[user_id]
+                    await old_ws.close(code=1000, reason="new_connection")
+                    logger.info(f"Cerrada conexión anterior para usuario {user_id}")
+                except Exception as e:
+                    logger.warning(f"Error al cerrar conexión anterior: {e}")
+            
             # Registrar conexión
             self.active_connections[user_id] = websocket
             self.connection_timestamps[user_id] = time.time()
@@ -63,11 +73,30 @@ class ConnectionManager:
             
             logger.info(f"Usuario {user_id} conectado. Total conexiones: {len(self.active_connections)}")
             
+            # Enviar mensaje inmediato de confirmación con info de sesión
+            try:
+                session_info = {
+                    "type": "connection_status",
+                    "data": {
+                        "status": "connected",
+                        "session_id": str(uuid.uuid4()),  # ID de sesión único
+                        "server_time": datetime.now(timezone.utc).isoformat(),
+                        "ping_interval": self.ping_interval
+                    }
+                }
+                await websocket.send_json(session_info)
+            except Exception as e:
+                logger.warning(f"Error al enviar confirmación inicial: {e}")
+            
             # Publicar estado de conexión en Redis
             r = await self.get_redis()
             await r.publish(
                 "user_presence", 
-                json.dumps({"user_id": user_id, "status": "online", "timestamp": time.time()})
+                json.dumps({
+                    "user_id": user_id, 
+                    "status": "online", 
+                    "timestamp": time.time()
+                })
             )
             await r.set(f"user:{user_id}:status", "online", ex=3600)  # TTL 1 hora
             
@@ -79,7 +108,7 @@ class ConnectionManager:
             logger.error(f"Error en conexión WebSocket para usuario {user_id}: {str(e)}")
             await self._handle_reconnection(user_id)
             return False
-    
+        
     def _start_ping_task(self, user_id: str, websocket: WebSocket):
         """Inicia el ping periódico para mantener viva la conexión"""
         if user_id in self.ongoing_pings:
@@ -188,12 +217,14 @@ class ConnectionManager:
         # Calcular backoff exponencial con jitter (aleatorio)
         # Formula: min(max_backoff, base * 2^attempts + random_jitter)
         base_backoff = 1
-        max_backoff = 300  # 5 minutos
+        # Reducir max_backoff para clientes móviles
+        max_backoff = 60  # 1 minuto máximo para entornos móviles (era 300 - 5 minutos)
         
-        # Calcular backoff exponencial
+        # Calcular backoff exponencial con menos agresividad
+        power = min(info["attempts"], 6)  # Limitar exponente para evitar esperas muy largas
         backoff = min(
             max_backoff,
-            base_backoff * (2 ** min(info["attempts"], 8)) + (time.time() % 1)  # jitter
+            base_backoff * (2 ** power) + (time.time() % 1)  # jitter
         )
         
         info["last_backoff"] = backoff
@@ -201,20 +232,37 @@ class ConnectionManager:
         # Almacenar en Redis para posible uso en frontend
         try:
             r = await self.get_redis()
+            reconnect_data = {
+                "attempts": info["attempts"],
+                "backoff": backoff,
+                "next_attempt": (datetime.now() + timedelta(seconds=backoff)).isoformat(),
+                "retry_delay": backoff  # Explícitamente incluir retry_delay para clientes
+            }
+            
             await r.set(
                 f"user:{user_id}:reconnect", 
-                json.dumps({
-                    "attempts": info["attempts"],
-                    "backoff": backoff,
-                    "next_attempt": (datetime.now() + timedelta(seconds=backoff)).isoformat()
-                }),
+                json.dumps(reconnect_data),
                 ex=int(backoff * 2)  # TTL
             )
+            
+            # También enviar el mensaje de reconnect a otros dispositivos del mismo usuario
+            # que puedan estar conectados
+            try:
+                if user_id in self.active_connections:
+                    websocket = self.active_connections[user_id]
+                    await websocket.send_json({
+                        "type": "reconnect_info",
+                        "data": reconnect_data
+                    })
+            except Exception as e:
+                # No es crítico si falla
+                logger.warning(f"No se pudo enviar info de reconexión: {e}")
+                
         except Exception as e:
             logger.error(f"Error al guardar info de reconexión en Redis: {str(e)}")
         
         logger.info(f"Reconexión para usuario {user_id}: intento {info['attempts']}, backoff {backoff}s")
-    
+
     async def force_disconnect(self, user_id: str, reason: str = "unknown"):
         """Fuerza desconexión y maneja estado de usuario"""
         if user_id in self.active_connections:
