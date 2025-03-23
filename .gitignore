@@ -1,0 +1,38 @@
+cloudflared.deb
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+*.env
+venv/
+.envrc
+.mypy_cache/
+.db
+*.sqlite3
+instance/
+.logs/
+*.log
+
+# Docker
+docker-compose.override.yml
+docker-compose.override.yaml
+
+# FastAPI & Uvicorn
+*.pid
+*.sock
+
+# IDEs y editores
+.vscode/
+.idea/
+*.iml
+
+# Static & Media (si se generan dinámicamente)
+backend/static/
+backend/media/
+
+# PostgreSQL & Redis
+pgdata/
+redis_data/
