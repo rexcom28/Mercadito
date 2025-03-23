@@ -18,6 +18,7 @@ class OfferCreate(OfferBase):
 
 class OfferUpdate(BaseModel):
     status: str
+    version: int
     
     @validator('status')
     def status_must_be_valid(cls, v):
@@ -34,7 +35,7 @@ class OfferResponse(OfferBase):
     expires_at: datetime
     created_at: datetime
     updated_at: Optional[datetime] = None
-    version: int
+    version: int  # Añadido el campo version para que se incluya en la respuesta
     
     class Config:
         from_attributes = True

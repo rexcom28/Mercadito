@@ -213,21 +213,25 @@ def get_offer(
     
     return offer
 
-@router.patch("/{offer_id}", response_model=OfferResponse)
-async def update_offer_status(
+@router.patch("/{offer_id}/respond", response_model=OfferResponse)
+async def update_offer_status_via_body(
     *,
     db: Session = Depends(deps.get_db),
     offer_id: str,
-    status: str = Query(..., description="Nuevo estado: 'accepted' o 'rejected'"),
-    version: int = Query(..., description="Versión actual de la oferta (para control de concurrencia)"),
+    offer_update: OfferUpdate,  # Recibe los datos en el cuerpo del request
     current_user: User = Depends(deps.get_current_user),
     background_tasks: BackgroundTasks,
 ) -> Any:
     """
     Actualizar el estado de una oferta (aceptar o rechazar) con control de concurrencia optimista.
+    Este endpoint utiliza el cuerpo de la petición en lugar de query parameters.
     """
+    # Extraer status y version del cuerpo del request
+    status_value = offer_update.status
+    version = offer_update.version
+    
     # Verificar que el estado sea válido
-    if status not in ["accepted", "rejected"]:
+    if status_value not in ["accepted", "rejected"]:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="El estado debe ser 'accepted' o 'rejected'",
@@ -245,7 +249,7 @@ async def update_offer_status(
     if offer.version != version:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="La oferta ha sido modificada. Recarga y vuelve a intentar.",
+            detail=f"La oferta ha sido modificada. Versión actual: {offer.version}. Recarga y vuelve a intentar.",
         )
     
     # Verificar que el usuario sea el vendedor
@@ -262,8 +266,19 @@ async def update_offer_status(
             detail=f"No se puede actualizar una oferta con estado '{offer.status}'",
         )
     
-    # Verificar que la oferta no haya expirado
-    if offer.expires_at < datetime.now():
+    now = datetime.now()
+    expires_at = offer.expires_at
+    
+    # Si expires_at tiene zona horaria pero now no, convertir now a aware
+    if expires_at.tzinfo is not None and now.tzinfo is None:
+        # Convertir a aware usando la misma zona horaria que expires_at
+        now = now.replace(tzinfo=expires_at.tzinfo)
+    # Si now tiene zona horaria pero expires_at no, convertir expires_at a aware
+    elif now.tzinfo is not None and expires_at.tzinfo is None:
+        # Convertir a aware usando la misma zona horaria que now
+        expires_at = expires_at.replace(tzinfo=now.tzinfo)
+    
+    if expires_at < now:
         # Actualizar a expirada
         offer.status = "expired"
         offer.updated_at = datetime.now()
@@ -278,7 +293,7 @@ async def update_offer_status(
     
     try:
         # Actualizar el estado de la oferta
-        offer.status = status
+        offer.status = status_value
         offer.updated_at = datetime.now()
         offer.version += 1
         
@@ -286,7 +301,7 @@ async def update_offer_status(
         product = None
         other_offers = []
         
-        if status == "accepted":
+        if status_value == "accepted":
             product = db.query(Product).filter(Product.id == offer.product_id).with_for_update().first()
             if product:
                 # Verificar que el producto siga disponible
@@ -326,12 +341,12 @@ async def update_offer_status(
             offer.seller_id,
             current_user.full_name,
             offer.buyer_id,
-            status,
+            status_value,
             offer.updated_at.isoformat(),
         )
         
         # Si se aceptó la oferta, notificar a otros compradores (en segundo plano)
-        if status == "accepted" and other_offers:
+        if status_value == "accepted" and other_offers:
             buyer_ids = [o.buyer_id for o in other_offers]
             background_tasks.add_task(
                 notify_other_buyers,
