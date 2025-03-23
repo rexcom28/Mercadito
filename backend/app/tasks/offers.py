@@ -1,76 +1,199 @@
-import asyncio
+# app/tasks/offers.py
+from celery import shared_task
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
-from sqlalchemy import select, update, and_
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
-# from app.db.session import async_session_maker
-from app.db.session import AsyncSessionLocal
+import json
+import redis
+from sqlalchemy import create_engine, text, select, update, and_
+from sqlalchemy.orm import sessionmaker, Session
+from app.core.config import settings
 from app.models.offer import Offer
 from app.models.product import Product
 from app.models.user import User
-from app.websockets.connection import manager
 
 logger = logging.getLogger(__name__)
 
-# Intervalo para el procesamiento de ofertas expiradas (en segundos)
-OFFER_EXPIRATION_CHECK_INTERVAL = 300  # 5 minutos
+# Conexión a base de datos para tareas de Celery
+def get_db_session() -> Session:
+    engine = create_engine(str(settings.DATABASE_URL))
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    db = SessionLocal()
+    try:
+        return db
+    except Exception as e:
+        db.close()
+        raise e
 
-async def expire_offers() -> List[Dict[str, Any]]:
+# Conexión a Redis para tareas de Celery
+def get_redis_connection():
+    return redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
+
+@shared_task(bind=True, max_retries=5)
+def send_notification(self, user_id: str, notification_data: dict):
     """
-    Marca como expiradas las ofertas que han pasado su fecha de expiración.
-    Retorna la lista de ofertas expiradas.
+    Envía una notificación a un usuario a través de Redis para WebSockets.
+    Guarda el mensaje como pendiente si el usuario no está conectado.
     """
-    # Verificar que AsyncSessionLocal esté inicializado
-    from app.db.session import AsyncSessionLocal, init_db_connection, _is_initialized
+    try:
+        r = get_redis_connection()
+        
+        # Verificar si el usuario está conectado
+        is_online = r.get(f"user:{user_id}:status") == "online"
+        
+        if is_online:
+            # Publicar en canal de usuario
+            channel_name = f"user:{user_id}:notifications"
+            message_data = json.dumps(notification_data)
+            result = r.publish(channel_name, message_data)
+            
+            # Si nadie recibió la publicación, guardar como pendiente
+            if result == 0:
+                logger.warning(f"Usuario {user_id} aparece online pero nadie recibió la notificación")
+                _save_pending_message(r, user_id, notification_data)
+        else:
+            # Usuario offline, guardar mensaje pendiente
+            _save_pending_message(r, user_id, notification_data)
+            
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error al enviar notificación: {str(e)}")
+        retry_delay = 60 * (2 ** self.request.retries)  # 60s, 120s, 240s, etc.
+        raise self.retry(exc=e, countdown=retry_delay)
+
+def _save_pending_message(redis_conn, user_id: str, message: dict):
+    """Almacena un mensaje pendiente para entrega posterior"""
+    try:
+        message_data = json.dumps(message)
+        
+        # Guardar en lista de mensajes pendientes
+        redis_conn.lpush(f"user:{user_id}:pending_messages", message_data)
+        
+        # Establecer TTL (7 días)
+        redis_conn.expire(f"user:{user_id}:pending_messages", 86400 * 7)
+        
+        # Incrementar contador
+        redis_conn.incr(f"user:{user_id}:pending_count")
+        redis_conn.expire(f"user:{user_id}:pending_count", 86400 * 7)
+        
+        logger.info(f"Mensaje guardado para entrega posterior a {user_id}")
+        return True
+    except Exception as e:
+        logger.error(f"Error al guardar mensaje pendiente: {e}")
+        return False
+
+@shared_task(bind=True, name="app.tasks.offers.notify_new_offer_task")
+def notify_new_offer_task(self, offer_id: str, product_id: str, product_title: str, 
+                          buyer_id: str, buyer_name: str, seller_id: str, 
+                          amount: float, currency: str, message: Optional[str], 
+                          expires_at: str, created_at: str):
+    """Tarea Celery para notificar sobre nuevas ofertas"""
+    notification_data = {
+        "type": "offer",
+        "action": "created",
+        "data": {
+            "id": offer_id,
+            "product_id": product_id,
+            "product_title": product_title,
+            "buyer_id": buyer_id,
+            "buyer_name": buyer_name,
+            "amount": amount,
+            "currency": currency,
+            "message": message,
+            "expires_at": expires_at,
+            "created_at": created_at,
+        }
+    }
     
-    if AsyncSessionLocal is None or not _is_initialized:
-        logger.warning("AsyncSessionLocal no está inicializado, inicializando...")
-        success = await init_db_connection()
-        if not success or AsyncSessionLocal is None:
-            logger.error("No se pudo inicializar AsyncSessionLocal")
-            return []
+    return send_notification.delay(seller_id, notification_data)
+
+@shared_task(bind=True, name="app.tasks.offers.notify_offer_update_task")
+def notify_offer_update_task(self, offer_id: str, product_id: str, seller_id: str, 
+                             seller_name: str, buyer_id: str, status: str, updated_at: str):
+    """Tarea Celery para notificar actualizaciones de ofertas"""
+    status_text = "aceptada" if status == "accepted" else "rechazada"
     
-    now = datetime.now(timezone.utc) 
-    expired_offers = []
+    notification_data = {
+        "type": "offer",
+        "action": status,
+        "data": {
+            "id": offer_id,
+            "product_id": product_id,
+            "seller_id": seller_id,
+            "seller_name": seller_name,
+            "status": status,
+            "updated_at": updated_at,
+            "message": f"Tu oferta ha sido {status_text}",
+        }
+    }
     
-    async with AsyncSessionLocal() as session:
-        # Obtener ofertas pendientes que han expirado
-        result = await session.execute(
-            select(Offer)
-            .options(
-                selectinload(Offer.buyer),
-                selectinload(Offer.product)
-            )
-            .where(
-                and_(
-                    Offer.status == "pending",
-                    Offer.expires_at < now
-                )
-            )
-        )
-        offers_to_expire = result.scalars().all()
+    return send_notification.delay(buyer_id, notification_data)
+
+@shared_task(bind=True, name="app.tasks.offers.notify_other_buyers_task")
+def notify_other_buyers_task(self, product_id: str, buyer_ids: List[str], message: str):
+    """Tarea Celery para notificar a otros compradores cuando una oferta es aceptada"""
+    notification_data = {
+        "type": "product",
+        "action": "sold",
+        "data": {
+            "product_id": product_id,
+            "message": message,
+        }
+    }
+    
+    results = []
+    for buyer_id in buyer_ids:
+        result = send_notification.delay(buyer_id, notification_data)
+        results.append(result)
+    
+    return f"Notificaciones enviadas a {len(buyer_ids)} compradores"
+
+@shared_task(bind=True, name="app.tasks.offers.notify_offer_cancelled_task")
+def notify_offer_cancelled_task(self, offer_id: str, product_id: str, 
+                                buyer_id: str, buyer_name: str, seller_id: str):
+    """Tarea Celery para notificar sobre cancelación de ofertas"""
+    notification_data = {
+        "type": "offer",
+        "action": "cancelled",
+        "data": {
+            "id": offer_id,
+            "product_id": product_id,
+            "buyer_id": buyer_id,
+            "buyer_name": buyer_name,
+            "message": "El comprador ha cancelado su oferta",
+        }
+    }
+    
+    return send_notification.delay(seller_id, notification_data)
+
+@shared_task(bind=True, name="app.tasks.offers.expire_offers_task")
+def expire_offers_task(self):
+    """Tarea Celery para marcar ofertas expiradas"""
+    db = get_db_session()
+    try:
+        now = datetime.now(timezone.utc)
+        expired_offers = []
+        
+        # Obtener ofertas pendientes expiradas
+        offers_to_expire = db.query(Offer).join(Product).join(
+            User, Offer.buyer_id == User.id
+        ).filter(
+            Offer.status == "pending",
+            Offer.expires_at < now
+        ).all()
         
         if not offers_to_expire:
-            return []
+            logger.info("No hay ofertas expiradas para procesar")
+            return "No hay ofertas expiradas"
         
-        # Actualizar estado en la base de datos (en un solo query)
-        offer_ids = [offer.id for offer in offers_to_expire]
-        await session.execute(
-            update(Offer)
-            .where(Offer.id.in_(offer_ids))
-            .values(
-                status="expired",
-                updated_at=now
-            )
-        )
-        
-        # Commit la transacción
-        await session.commit()
-        
-        # Procesar notificaciones para cada oferta expirada
+        # Actualizar estado de ofertas en una transacción
         for offer in offers_to_expire:
+            offer.status = "expired"
+            offer.updated_at = now
+            offer.version += 1
+            
+            # Construir datos para notificación
             offer_data = {
                 "id": offer.id,
                 "product_id": offer.product_id,
@@ -85,94 +208,49 @@ async def expire_offers() -> List[Dict[str, Any]]:
             }
             expired_offers.append(offer_data)
             
+            # Enviar notificaciones asíncronas
             # Notificar al comprador
-            await manager.send_personal_message(
-                {
-                    "type": "offer",
-                    "action": "expired",
-                    "data": {
-                        "id": offer.id,
-                        "product_id": offer.product_id,
-                        "product_title": offer_data["product_title"],
-                        "expires_at": offer.expires_at.isoformat(),
-                        "message": "Tu oferta ha expirado"
-                    }
-                },
-                offer.buyer_id
-            )
+            buyer_notification = {
+                "type": "offer",
+                "action": "expired",
+                "data": {
+                    "id": offer.id,
+                    "product_id": offer.product_id,
+                    "product_title": offer_data["product_title"],
+                    "expires_at": offer.expires_at.isoformat(),
+                    "message": "Tu oferta ha expirado"
+                }
+            }
+            send_notification.delay(offer.buyer_id, buyer_notification)
             
             # Notificar al vendedor
-            await manager.send_personal_message(
-                {
-                    "type": "offer",
-                    "action": "expired",
-                    "data": {
-                        "id": offer.id,
-                        "product_id": offer.product_id,
-                        "product_title": offer_data["product_title"],
-                        "buyer_name": offer_data["buyer_name"],
-                        "amount": offer.amount,
-                        "currency": offer.currency,
-                        "expires_at": offer.expires_at.isoformat(),
-                        "message": "Una oferta ha expirado"
-                    }
-                },
-                offer.seller_id
-            )
-    
-    logger.info(f"Expiradas {len(expired_offers)} ofertas")
-    return expired_offers
-
-async def offer_expiration_task():
-    """
-    Tarea periódica para procesar ofertas expiradas.
-    """
-    logger.info("Iniciando tarea de expiración de ofertas")
-    
-    while True:
-        try:
-            # Procesar ofertas expiradas
-            expired = await expire_offers()
-            if expired:
-                logger.info(f"Expiradas {len(expired)} ofertas en este ciclo")
-            
-            # Esperar hasta el próximo ciclo
-            await asyncio.sleep(OFFER_EXPIRATION_CHECK_INTERVAL)
+            seller_notification = {
+                "type": "offer",
+                "action": "expired",
+                "data": {
+                    "id": offer.id,
+                    "product_id": offer.product_id,
+                    "product_title": offer_data["product_title"],
+                    "buyer_name": offer_data["buyer_name"],
+                    "amount": offer.amount,
+                    "currency": offer.currency,
+                    "expires_at": offer.expires_at.isoformat(),
+                    "message": "Una oferta ha expirado"
+                }
+            }
+            send_notification.delay(offer.seller_id, seller_notification)
         
-        except Exception as e:
-            logger.error(f"Error en tarea de expiración de ofertas: {str(e)}")
-            # Esperamos un poco en caso de error para no saturar logs
-            await asyncio.sleep(60)
-
-# Tarea que se iniciará en el evento de inicio de la aplicación
-offer_expiration_background_task = None
-
-async def start_offer_expiration_task():
-    """
-    Inicia la tarea de expiración de ofertas en segundo plano.
-    """
-    global offer_expiration_background_task
-    
-    # Asegurarse de que la base de datos está inicializada
-    from app.db.session import init_db_connection, _is_initialized
-    
-    if not _is_initialized:
-        logger.info("Inicializando base de datos antes de iniciar tarea de expiración...")
-        success = await init_db_connection()
-        if not success:
-            logger.error("No se pudo inicializar la base de datos para la tarea de expiración")
-            return
-    
-    if offer_expiration_background_task is None:
-        offer_expiration_background_task = asyncio.create_task(offer_expiration_task())
-        logger.info("Tarea de expiración de ofertas iniciada")
-
-def stop_offer_expiration_task():
-    """
-    Detiene la tarea de expiración de ofertas.
-    """
-    global offer_expiration_background_task
-    if offer_expiration_background_task is not None:
-        offer_expiration_background_task.cancel()
-        offer_expiration_background_task = None
-        logger.info("Tarea de expiración de ofertas detenida")
+        # Confirmar transacción
+        db.commit()
+        
+        logger.info(f"Expiradas {len(expired_offers)} ofertas")
+        return f"Expiradas {len(expired_offers)} ofertas"
+        
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error al expirar ofertas: {str(e)}")
+        # Reintento con backoff exponencial
+        retry_delay = 60 * (2 ** self.request.retries)
+        raise self.retry(exc=e, countdown=retry_delay)
+    finally:
+        db.close()

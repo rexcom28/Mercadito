@@ -26,7 +26,35 @@ class ConnectionManager:
         asyncio.create_task(self._connection_monitor())
         # Iniciar tarea de limpieza de reconexiones
         asyncio.create_task(self._clean_reconnection_info())
-        
+
+    async def _listen_to_redis_channel(self, user_id: str, websocket: WebSocket):
+        """Escucha el canal de Redis para mensajes de Celery"""
+        try:
+            r = await self.get_redis()
+            pubsub = r.pubsub()
+            
+            # Suscribirse al canal específico para este usuario
+            channel_name = f"user:{user_id}:notifications"
+            await pubsub.subscribe(channel_name)
+            
+            # Iniciar tarea de escucha
+            async for message in pubsub.listen():
+                if message['type'] == 'message':
+                    try:
+                        # Decodificar y enviar el mensaje
+                        data = json.loads(message['data'])
+                        await websocket.send_json(data)
+                    except Exception as e:
+                        logger.error(f"Error procesando mensaje de Redis: {e}")
+                        
+        except Exception as e:
+            logger.error(f"Error en escucha de Redis: {e}")
+        finally:
+            # Asegurar que se cierre la suscripción
+            try:
+                await pubsub.unsubscribe(channel_name)
+            except:
+                pass       
     async def get_redis(self) -> redis.Redis:
         if self.redis_pool is None:
             self.redis_pool = redis.ConnectionPool.from_url(
@@ -37,6 +65,8 @@ class ConnectionManager:
     async def connect(self, websocket: WebSocket, user_id: str):
         try:
             await websocket.accept()
+            # Iniciar tarea de escucha de Redis para mensajes de Celery
+            asyncio.create_task(self._listen_to_redis_channel(user_id, websocket))
             
             # Si hay una conexión existente, cerrarla para evitar duplicados
             if user_id in self.active_connections:
