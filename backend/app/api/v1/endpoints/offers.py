@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Body, Depends, HTTPException, status, Query, BackgroundTasks
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 from datetime import datetime, timedelta, timezone
 from app.core.utils import normalize_datetime_comparison 
 import uuid
@@ -59,6 +59,7 @@ async def create_offer(
     ).first()
     
     if not product:
+        # Este es un error 404 específico, no un error de conexión a BD
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Producto no encontrado o no disponible",
@@ -85,40 +86,55 @@ async def create_offer(
         )
     
     # Crear la oferta con una expiración de 24 horas
-    expires_at = datetime.now() + timedelta(days=1)
+    expires_at = datetime.now(timezone.utc) + timedelta(days=1)  # Usar UTC
     
-    db_offer = Offer(
-        product_id=offer_in.product_id,
-        buyer_id=current_user.id,
-        seller_id=product.seller_id,
-        amount=offer_in.amount,
-        currency=product.currency,  # Usar la misma moneda que el producto
-        message=offer_in.message,
-        expires_at=expires_at,
-        version=1,  # Versión inicial para control de concurrencia
-    )
-    
-    db.add(db_offer)
-    db.commit()
-    db.refresh(db_offer)
-    
-    # Notificar al vendedor a través de WebSockets (en segundo plano)
-    background_tasks.add_task(
-        notify_new_offer,
-        db_offer.id,
-        db_offer.product_id,
-        product.title,
-        db_offer.buyer_id,
-        current_user.full_name,
-        db_offer.seller_id,
-        db_offer.amount,
-        db_offer.currency,
-        db_offer.message,
-        db_offer.expires_at.isoformat(),
-        db_offer.created_at.isoformat(),
-    )
-    
-    return db_offer
+    # Iniciar transacción explícita
+    try:
+        # Crear la oferta
+        db_offer = Offer(
+            product_id=offer_in.product_id,
+            buyer_id=current_user.id,
+            seller_id=product.seller_id,
+            amount=offer_in.amount,
+            currency=product.currency,  # Usar la misma moneda que el producto
+            message=offer_in.message,
+            expires_at=expires_at,
+            version=1,  # Versión inicial para control de concurrencia
+        )
+        
+        db.add(db_offer)
+        db.commit()
+        db.refresh(db_offer)
+        
+        # Notificar al vendedor a través de WebSockets (en segundo plano)
+        background_tasks.add_task(
+            notify_new_offer,
+            db_offer.id,
+            db_offer.product_id,
+            product.title,
+            db_offer.buyer_id,
+            current_user.full_name,
+            db_offer.seller_id,
+            db_offer.amount,
+            db_offer.currency,
+            db_offer.message,
+            db_offer.expires_at.isoformat(),
+            db_offer.created_at.isoformat(),
+        )
+        
+        return db_offer
+        
+    except Exception as e:
+        # Si hay error en la transacción, hacer rollback
+        db.rollback()
+        logger.error(f"Error al crear oferta: {str(e)}")
+        
+        # Garantizar que no convertimos otros errores en errores de BD
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error al procesar la oferta: {str(e)}",
+        )
+
 
 async def notify_new_offer(
     offer_id: str,
@@ -467,89 +483,98 @@ async def cancel_offer(
     *,
     db: Session = Depends(deps.get_db),
     offer_id: str,
-    cancel_data: dict = Body(..., description="Datos para cancelar la oferta", 
-                           example={"version": 1}),
+    cancel_data: Optional[Dict[str, Any]] = Body(None),  # Aceptar body opcional
+    version: Optional[int] = Query(None),  # Mantener compatibilidad con versión query parameter
     current_user: User = Depends(deps.get_current_user),
     background_tasks: BackgroundTasks,
 ):
     """
     Cancelar una oferta realizada (solo el comprador puede cancelar).
-    Requiere un cuerpo JSON con:
-    - version: número de versión actual de la oferta
-
-    Ejemplo:
-    ```
-    {
-        "version": 1
-    }
-    ```
+    Se puede proporcionar la versión tanto en el cuerpo de la petición como en query parameter.
     """
-    # Extraer versión del cuerpo del request
-    version = cancel_data.get("version")
-    if not version:
+    # Extraer versión del cuerpo o del query parameter
+    body_version = None
+    if cancel_data:
+        body_version = cancel_data.get("version")
+    
+    # Usar la versión del body si está disponible, de lo contrario usar la del query
+    version_to_use = body_version if body_version is not None else version
+    
+    if version_to_use is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="El campo 'version' es requerido",
-        )
-    
-    # Obtener la oferta con bloqueo pesimista
-    offer = db.query(Offer).filter(Offer.id == offer_id).with_for_update().first()
-    if not offer:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Oferta no encontrada",
-        )
-    
-    # Verificar versión para control de concurrencia optimista
-    if offer.version != version:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="La oferta ha sido modificada. Recarga y vuelve a intentar.",
-        )
-    
-    # Verificar que el usuario sea el comprador
-    if offer.buyer_id != current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Solo el comprador puede cancelar la oferta",
-        )
-    
-    # Verificar que la oferta esté pendiente
-    if offer.status != "pending":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"No se puede cancelar una oferta con estado '{offer.status}'",
+            detail="Se requiere el campo 'version' (en el cuerpo o como parámetro)",
         )
     
     try:
-        # Obtener información del producto y vendedor antes de eliminar
-        product_id = offer.product_id
-        seller_id = offer.seller_id
+        # Obtener la oferta con bloqueo pesimista
+        offer = db.query(Offer).filter(Offer.id == offer_id).with_for_update().first()
+        if not offer:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Oferta no encontrada",
+            )
         
-        # Eliminar la oferta (alternativa: cambiar estado a "cancelled")
-        db.delete(offer)
-        db.commit()
+        # Verificar versión para control de concurrencia optimista
+        if offer.version != version_to_use:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"La oferta ha sido modificada. Versión actual: {offer.version}. Recarga y vuelve a intentar.",
+            )
         
-        # Notificar al vendedor sobre la cancelación (en segundo plano)
-        background_tasks.add_task(
-            notify_offer_cancelled,
-            offer_id,
-            product_id,
-            offer.buyer_id,
-            current_user.full_name,
-            seller_id,
-        )
+        # Verificar que el usuario sea el comprador
+        if offer.buyer_id != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Solo el comprador puede cancelar la oferta",
+            )
         
-        return {"message": "Oferta cancelada correctamente"}
+        # Verificar que la oferta esté pendiente
+        if offer.status != "pending":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"No se puede cancelar una oferta con estado '{offer.status}'",
+            )
+        
+        # Implementar transacción explícita
+        try:
+            # Obtener información del producto y vendedor antes de eliminar
+            product_id = offer.product_id
+            seller_id = offer.seller_id
+            
+            # Eliminar la oferta (alternativa: cambiar estado a "cancelled")
+            db.delete(offer)
+            db.commit()
+            
+            # Notificar al vendedor sobre la cancelación (en segundo plano)
+            background_tasks.add_task(
+                notify_offer_cancelled,
+                offer_id,
+                product_id,
+                offer.buyer_id,
+                current_user.full_name,
+                seller_id,
+            )
+            
+            return {"message": "Oferta cancelada correctamente"}
+            
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Error al cancelar oferta: {str(e)}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Error al cancelar la oferta: {str(e)}",
+            )
     
+    except HTTPException as http_ex:
+        # Propagar excepciones HTTP sin modificar
+        raise http_ex
     except Exception as e:
-        db.rollback()
-        logger.error(f"Error al cancelar oferta: {str(e)}")
+        logger.error(f"Error inesperado en cancelación de oferta: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Error interno del servidor",
+            detail=f"Error inesperado: {str(e)}",
         )
-
 async def notify_offer_cancelled(
     offer_id: str,
     product_id: str,

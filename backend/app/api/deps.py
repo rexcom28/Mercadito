@@ -21,37 +21,29 @@ def get_db() -> Generator[Session, None, None]:
     """
     Dependency para obtener una sesión de base de datos sincrónica.
     """
-    # Importamos aquí para evitar problemas de importación circular
-    from app.db.session import SessionLocal, init_db_connection, _is_initialized
+    from app.db.session import SessionLocal
     
-    # Verificar inicialización una sola vez al inicio
-    if not _is_initialized:
-        logger.warning("Conexión a base de datos no inicializada en get_db, esperando inicialización...")
-        
-        # Si la base de datos no está inicializada, es mejor lanzar una excepción
-        # en lugar de intentar inicializarla aquí, ya que la inicialización debe ocurrir
-        # en el evento de inicio de la aplicación
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="El servicio está inicializándose, por favor intente de nuevo en unos momentos"
-        )
-    
-    # Si llegamos aquí, la BD está inicializada
     db = SessionLocal()
     try:
-        # Probar la conexión con text()
+        # Probar conexión explícitamente antes de usar
         db.execute(text("SELECT 1"))
         yield db
     except Exception as e:
         logger.error(f"Error en sesión de base de datos: {e}")
         db.rollback()
+        # Proporcionar un mensaje de error más descriptivo para ayudar en la depuración
+        error_message = f"Error de conexión a la base de datos: {str(e)}"
+        if "Connection refused" in str(e):
+            error_message = "No se pudo conectar a la base de datos. Verifique que el servicio esté activo."
+        elif "timeout" in str(e).lower():
+            error_message = "Tiempo de espera agotado al conectar con la base de datos."
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Error de conexión a la base de datos"
+            detail=error_message
         )
     finally:
         db.close()
-
+        
 async def get_current_user(
     db: Session = Depends(get_db),
     token: str = Depends(oauth2_scheme),
