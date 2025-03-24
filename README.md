@@ -1,35 +1,62 @@
-# Marketplace en Tiempo Real - MVP
+# Estructura Docker para Marketplace en Tiempo Real
 
-Un marketplace interactivo en tiempo real donde vendedores y compradores pueden interactuar dinámicamente, con notificaciones instantáneas y sistema de ofertas.
+## Organización de Dockerfiles
 
-## Características principales
+La aplicación está separada en diferentes servicios, cada uno con su propio Dockerfile optimizado:
 
-- Registro de usuarios con perfiles de comprador y vendedor
-- Listado de productos con imágenes
-- Comunicación en tiempo real mediante WebSockets
-- Sistema de ofertas y contraofertas
-- Notificaciones instantáneas
+### 1. API (FastAPI)
+- **Ubicación**: `./docker/api/Dockerfile`
+- **Responsabilidad**: Ejecutar la API REST de FastAPI y gestionar WebSockets
+- **Optimizaciones**: Incluye configuración para Swagger UI y archivos estáticos
 
-## Requisitos técnicos
+### 2. Celery Worker
+- **Ubicación**: `./docker/worker/Dockerfile`
+- **Responsabilidad**: Procesar tareas asíncronas en segundo plano
+- **Optimizaciones**: Configuración mínima necesaria para ejecutar workers
 
-- Docker y Docker Compose
-- VPS con KVM2 (mínimo 2 vCPU, 8GB RAM)
-- Dominio y certificados SSL (para producción)
+### 3. Celery Beat
+- **Ubicación**: `./docker/beat/Dockerfile`
+- **Responsabilidad**: Programar tareas periódicas (como expiración de ofertas)
+- **Optimizaciones**: Incluye volumen para el archivo de programación
 
-## Estructura del proyecto
+### 4. Flower
+- **Ubicación**: `./docker/flower/Dockerfile`
+- **Responsabilidad**: Proporcionar un panel de monitoreo para Celery
+- **Optimizaciones**: Sólo copia los archivos necesarios para Celery
 
-El proyecto sigue una arquitectura de microservicios containerizados:
+## Volúmenes
 
-- **API REST** con FastAPI
-- **WebSockets** para comunicación en tiempo real
-- **PostgreSQL** para datos persistentes
-- **Redis** para gestión de conexiones y pub/sub
-- **Nginx** como proxy inverso y servidor web
+El sistema utiliza varios volúmenes para datos persistentes:
 
-## Configuración inicial
+- `postgres_data`: Almacenamiento de la base de datos
+- `redis_data`: Datos de Redis para caché, broker y pubsub
+- `celery_beat_data`: Archivo de programación para Celery beat
 
-### 1. Clonar el repositorio
+## Redes
+
+Todos los servicios están conectados a través de la red `app-network`, lo que permite la comunicación entre contenedores usando los nombres de servicio como nombres de host.
+
+## Cómo ejecutar
 
 ```bash
-git clone https://github.com/tu-usuario/marketplace-mvp.git
-cd marketplace-mvp
+# Iniciar todos los servicios
+docker-compose up
+
+# Iniciar todos los servicios en segundo plano
+docker-compose up -d
+
+# Iniciar servicios específicos
+docker-compose up api celery-worker
+
+# Escalar workers
+docker-compose up --scale celery-worker=3
+
+# Reconstruir imágenes
+docker-compose build
+```
+
+## Acceso a los servicios
+
+- **API**: http://localhost:8000
+- **Swagger UI**: http://localhost:8000/docs
+- **Flower Dashboard**: http://localhost:5555

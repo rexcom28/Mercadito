@@ -13,7 +13,6 @@ from app.core.config import settings
 
 from app.middleware.security import setup_security_middleware
 from app.websockets.router import websocket_router
-from app.tasks.offers import start_offer_expiration_task, stop_offer_expiration_task
 
 # Configurar logging
 logging.basicConfig(
@@ -21,19 +20,6 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
-
-# Tareas en segundo plano
-background_tasks = []
-
-# Inicializar la base de datos primero
-async def initialize_database():
-    from app.db.session import init_db_connection, _is_initialized
-    
-    if not _is_initialized:
-        logger.info("Inicializando conexión a la base de datos...")
-        await init_db_connection(max_retries=5, initial_delay=2)
-    else:
-        logger.info("La base de datos ya está inicializada")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -82,9 +68,9 @@ async def lifespan(app: FastAPI):
                 
             logger.info("Tablas de base de datos creadas/verificadas")
             
-            # Iniciar tareas en segundo plano
-            await start_offer_expiration_task()
-            logger.info("Tareas en segundo plano iniciadas")
+            # Nota: Ya no necesitamos iniciar tareas en segundo plano manualmente
+            # para la expiración de ofertas porque ahora se manejan con Celery beat
+            logger.info("La expiración de ofertas se maneja con Celery beat")
             
             break  # Exit the retry loop if successful
             
@@ -104,23 +90,22 @@ async def lifespan(app: FastAPI):
     # Shutdown logic
     logger.info("Deteniendo la aplicación...")
     
-    # Stop background tasks
-    for task in background_tasks:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-    
-    # Stop specific tasks
-    await stop_offer_expiration_task()
-    
     # Close database connections
     if engine is not None:
         await engine.dispose()
     
     logger.info("Conexiones a base de datos cerradas")
     logger.info("Aplicación detenida correctamente")
+
+# Inicializar la base de datos primero
+async def initialize_database():
+    from app.db.session import init_db_connection, _is_initialized
+    
+    if not _is_initialized:
+        logger.info("Inicializando conexión a la base de datos...")
+        await init_db_connection(max_retries=5, initial_delay=2)
+    else:
+        logger.info("La base de datos ya está inicializada")
 
 # Crear la aplicación FastAPI
 app = FastAPI(
@@ -167,5 +152,3 @@ async def custom_swagger_ui_html():
         swagger_css_url="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.12.0/swagger-ui.css",
         swagger_ui_parameters={"persistAuthorization": True}
     )
-
-# El resto del archivo sigue igual...

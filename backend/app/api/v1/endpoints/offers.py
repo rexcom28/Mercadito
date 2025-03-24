@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Body, Depends, HTTPException, status, Query, BackgroundTasks
+from fastapi import APIRouter, Body, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from typing import Any, Dict, List, Optional
@@ -16,6 +16,15 @@ from app.websockets.connection import manager
 from app.core.config import settings
 from sqlalchemy.exc import IntegrityError
 from contextlib import contextmanager
+
+# Importar tareas Celery
+from app.tasks.offers import (
+    notify_new_offer_task,
+    notify_offer_update_task,
+    notify_other_buyers_task,
+    notify_offer_cancelled_task
+)
+
 @contextmanager
 def transaction_scope(db: Session):
     """Proporciona un contexto transaccional."""
@@ -47,7 +56,6 @@ async def create_offer(
     db: Session = Depends(deps.get_db),
     offer_in: OfferCreate,
     current_user: User = Depends(deps.get_current_user),
-    background_tasks: BackgroundTasks,
 ) -> Any:
     """
     Crear una nueva oferta para un producto.
@@ -106,9 +114,8 @@ async def create_offer(
         db.commit()
         db.refresh(db_offer)
         
-        # Notificar al vendedor a través de WebSockets (en segundo plano)
-        background_tasks.add_task(
-            notify_new_offer,
+        # Notificar al vendedor usando Celery
+        notify_new_offer_task.delay(
             db_offer.id,
             db_offer.product_id,
             product.title,
@@ -134,43 +141,6 @@ async def create_offer(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error al procesar la oferta: {str(e)}",
         )
-
-
-async def notify_new_offer(
-    offer_id: str,
-    product_id: str,
-    product_title: str,
-    buyer_id: str,
-    buyer_name: str,
-    seller_id: str,
-    amount: float,
-    currency: str,
-    message: Optional[str],
-    expires_at: str,
-    created_at: str,
-):
-    """
-    Función de notificación en segundo plano para nuevas ofertas.
-    """
-    await manager.send_personal_message(
-        {
-            "type": "offer",
-            "action": "created",
-            "data": {
-                "id": offer_id,
-                "product_id": product_id,
-                "product_title": product_title,
-                "buyer_id": buyer_id,
-                "buyer_name": buyer_name,
-                "amount": amount,
-                "currency": currency,
-                "message": message,
-                "expires_at": expires_at,
-                "created_at": created_at,
-            }
-        },
-        seller_id
-    )
 
 @router.get("/", response_model=List[OfferResponse])
 def get_offers(
@@ -259,7 +229,6 @@ async def update_offer_status_via_body(
     offer_id: str,
     offer_update: OfferUpdate,  # Recibe los datos en el cuerpo del request
     current_user: User = Depends(deps.get_current_user),
-    background_tasks: BackgroundTasks,
 ) -> Any:
     """
     Actualizar el estado de una oferta (aceptar o rechazar) con control de concurrencia optimista.
@@ -387,9 +356,8 @@ async def update_offer_status_via_body(
         # Refrescar oferta fuera de la transacción
         db.refresh(offer)
         
-        # Notificar al comprador sobre la actualización (en segundo plano)
-        background_tasks.add_task(
-            notify_offer_update,
+        # Notificar al comprador usando Celery
+        notify_offer_update_task.delay(
             offer.id,
             offer.product_id,
             offer.seller_id,
@@ -399,11 +367,10 @@ async def update_offer_status_via_body(
             offer.updated_at.isoformat(),
         )
         
-        # Si se aceptó la oferta, notificar a otros compradores (en segundo plano)
+        # Si se aceptó la oferta, notificar a otros compradores usando Celery
         if status_value == "accepted" and other_offers:
             buyer_ids = [o.buyer_id for o in other_offers]
-            background_tasks.add_task(
-                notify_other_buyers,
+            notify_other_buyers_task.delay(
                 offer.product_id,
                 buyer_ids,
                 "El producto ha sido vendido a otro comprador",
@@ -426,58 +393,6 @@ async def update_offer_status_via_body(
             detail="Error interno del servidor",
         )
 
-async def notify_offer_update(
-    offer_id: str,
-    product_id: str,
-    seller_id: str,
-    seller_name: str,
-    buyer_id: str,
-    status: str,
-    updated_at: str,
-):
-    """
-    Función para notificar al comprador sobre la actualización de su oferta.
-    """
-    status_text = "aceptada" if status == "accepted" else "rechazada"
-    
-    await manager.send_personal_message(
-        {
-            "type": "offer",
-            "action": status,
-            "data": {
-                "id": offer_id,
-                "product_id": product_id,
-                "seller_id": seller_id,
-                "seller_name": seller_name,
-                "status": status,
-                "updated_at": updated_at,
-                "message": f"Tu oferta ha sido {status_text}",
-            }
-        },
-        buyer_id
-    )
-
-async def notify_other_buyers(
-    product_id: str,
-    buyer_ids: List[str],
-    message: str,
-):
-    """
-    Función para notificar a otros compradores cuando una oferta es aceptada.
-    """
-    for buyer_id in buyer_ids:
-        await manager.send_personal_message(
-            {
-                "type": "product",
-                "action": "sold",
-                "data": {
-                    "product_id": product_id,
-                    "message": message,
-                }
-            },
-            buyer_id
-        )
-
 @router.delete("/{offer_id}", status_code=status.HTTP_200_OK)
 async def cancel_offer(
     *,
@@ -486,7 +401,6 @@ async def cancel_offer(
     cancel_data: Optional[Dict[str, Any]] = Body(None),  # Aceptar body opcional
     version: Optional[int] = Query(None),  # Mantener compatibilidad con versión query parameter
     current_user: User = Depends(deps.get_current_user),
-    background_tasks: BackgroundTasks,
 ):
     """
     Cancelar una oferta realizada (solo el comprador puede cancelar).
@@ -546,9 +460,8 @@ async def cancel_offer(
             db.delete(offer)
             db.commit()
             
-            # Notificar al vendedor sobre la cancelación (en segundo plano)
-            background_tasks.add_task(
-                notify_offer_cancelled,
+            # Notificar al vendedor sobre la cancelación usando Celery
+            notify_offer_cancelled_task.delay(
                 offer_id,
                 product_id,
                 offer.buyer_id,
@@ -575,27 +488,3 @@ async def cancel_offer(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error inesperado: {str(e)}",
         )
-async def notify_offer_cancelled(
-    offer_id: str,
-    product_id: str,
-    buyer_id: str,
-    buyer_name: str,
-    seller_id: str,
-):
-    """
-    Función para notificar al vendedor sobre la cancelación de una oferta.
-    """
-    await manager.send_personal_message(
-        {
-            "type": "offer",
-            "action": "cancelled",
-            "data": {
-                "id": offer_id,
-                "product_id": product_id,
-                "buyer_id": buyer_id,
-                "buyer_name": buyer_name,
-                "message": "El comprador ha cancelado su oferta",
-            }
-        },
-        seller_id
-    )

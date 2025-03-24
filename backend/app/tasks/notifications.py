@@ -11,6 +11,15 @@ logger = logging.getLogger(__name__)
 def send_notification(self, user_id, notification_type, action, data):
     """
     Envía una notificación a un usuario específico
+    
+    Args:
+        user_id (str): ID del usuario destinatario
+        notification_type (str): Tipo de notificación (offer, message, transaction, etc.)
+        action (str): Acción realizada (created, updated, cancelled, etc.)
+        data (dict): Datos de la notificación
+        
+    Returns:
+        bool: True si se envió correctamente, False en caso contrario
     """
     try:
         # Conectar a Redis directamente

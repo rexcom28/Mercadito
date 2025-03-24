@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Query
+from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
 from typing import Any, List, Optional
 import uuid
@@ -10,7 +10,7 @@ from app.models.transaction import Transaction
 from app.models.product import Product
 from app.models.offer import Offer
 from app.models.user import User
-from app.websockets.connection import manager
+from app.tasks.notifications import send_notification
 
 router = APIRouter()
 
@@ -20,7 +20,6 @@ async def create_transaction(
     db: Session = Depends(deps.get_db),
     transaction_in: TransactionCreate,
     current_user: User = Depends(deps.get_current_user),
-    background_tasks: BackgroundTasks,
 ) -> Any:
     """
     Crear una nueva transacción.
@@ -81,56 +80,27 @@ async def create_transaction(
     db.commit()
     db.refresh(db_transaction)
     
-    # Notificar al vendedor
-    background_tasks.add_task(
-        notify_transaction,
-        db_transaction.id,
-        db_transaction.product_id,
-        product.title,
-        db_transaction.buyer_id,
-        current_user.full_name,
-        db_transaction.seller_id,
-        db_transaction.amount,
-        db_transaction.currency,
-        db_transaction.status,
-        db_transaction.created_at.isoformat(),
+    # Notificar al vendedor usando Celery
+    notification_data = {
+        "id": db_transaction.id,
+        "product_id": db_transaction.product_id,
+        "product_title": product.title,
+        "buyer_id": db_transaction.buyer_id,
+        "buyer_name": current_user.full_name,
+        "amount": db_transaction.amount,
+        "currency": db_transaction.currency,
+        "status": db_transaction.status,
+        "created_at": db_transaction.created_at.isoformat(),
+    }
+    
+    send_notification.delay(
+        db_transaction.seller_id, 
+        "transaction", 
+        "created", 
+        notification_data
     )
     
     return db_transaction
-
-async def notify_transaction(
-    transaction_id: str,
-    product_id: str,
-    product_title: str,
-    buyer_id: str,
-    buyer_name: str,
-    seller_id: str,
-    amount: float,
-    currency: str,
-    status: str,
-    created_at: str,
-):
-    """
-    Función para notificar sobre una nueva transacción.
-    """
-    await manager.send_personal_message(
-        {
-            "type": "transaction",
-            "action": "created",
-            "data": {
-                "id": transaction_id,
-                "product_id": product_id,
-                "product_title": product_title,
-                "buyer_id": buyer_id,
-                "buyer_name": buyer_name,
-                "amount": amount,
-                "currency": currency,
-                "status": status,
-                "created_at": created_at,
-            }
-        },
-        seller_id
-    )
 
 @router.get("/", response_model=List[TransactionResponse])
 def get_transactions(
@@ -200,7 +170,6 @@ async def update_transaction_status(
     transaction_id: str,
     status: str = Query(..., description="Nuevo estado de la transacción"),
     current_user: User = Depends(deps.get_current_user),
-    background_tasks: BackgroundTasks,
 ) -> Any:
     """
     Actualizar el estado de una transacción.
@@ -242,34 +211,9 @@ async def update_transaction_status(
     db.commit()
     db.refresh(transaction)
     
-    # Notificar al otro usuario
+    # Notificar al otro usuario usando Celery
     recipient_id = transaction.buyer_id if current_user.id == transaction.seller_id else transaction.seller_id
     
-    background_tasks.add_task(
-        notify_status_change,
-        transaction.id,
-        transaction.product_id,
-        current_user.id,
-        current_user.full_name,
-        recipient_id,
-        status,
-        transaction.updated_at.isoformat(),
-    )
-    
-    return transaction
-
-async def notify_status_change(
-    transaction_id: str,
-    product_id: str,
-    user_id: str,
-    user_name: str,
-    recipient_id: str,
-    status: str,
-    updated_at: str,
-):
-    """
-    Función para notificar sobre un cambio de estado en la transacción.
-    """
     status_text = {
         "pending": "pendiente",
         "processing": "en proceso",
@@ -278,19 +222,21 @@ async def notify_status_change(
         "refunded": "reembolsada"
     }.get(status, status)
     
-    await manager.send_personal_message(
-        {
-            "type": "transaction",
-            "action": "updated",
-            "data": {
-                "id": transaction_id,
-                "product_id": product_id,
-                "user_id": user_id,
-                "user_name": user_name,
-                "status": status,
-                "updated_at": updated_at,
-                "message": f"La transacción ha sido marcada como {status_text}"
-            }
-        },
-        recipient_id
+    notification_data = {
+        "id": transaction.id,
+        "product_id": transaction.product_id,
+        "user_id": current_user.id,
+        "user_name": current_user.full_name,
+        "status": status,
+        "updated_at": transaction.updated_at.isoformat(),
+        "message": f"La transacción ha sido marcada como {status_text}"
+    }
+    
+    send_notification.delay(
+        recipient_id,
+        "transaction",
+        "updated",
+        notification_data
     )
+    
+    return transaction

@@ -19,32 +19,32 @@ services:
       start_period: 10s
     networks:
       - app-network
+      
   # Servicio de API principal (FastAPI)
   api:
     build:
-      context: ./backend
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: ./docker/api/Dockerfile
     restart: always
     ports:
       - "8000:8000"
     volumes:
       - ./backend:/app
       - ./backend/static:/app/static
+    env_file:
+      - ./.env
     environment:
       - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
       - REDIS_URL=redis://redis:6379/0
-      - SECRET_KEY=${SECRET_KEY}
-      - DEBUG=${DEBUG}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
     depends_on:
       db:
-        condition: service_healthy  # Wait for DB to be healthy
+        condition: service_healthy
       redis:
         condition: service_started
     networks:
       - app-network
 
-  # Redis para gestión de WebSockets y caché
+  # Redis para gestión de WebSockets, caché y broker de Celery
   redis:
     image: redis:alpine
     restart: always
@@ -52,6 +52,59 @@ services:
       - "6379:6379"
     volumes:
       - redis_data:/data
+    networks:
+      - app-network
+
+  # Celery worker para procesar tareas en segundo plano
+  celery-worker:
+    build:
+      context: .
+      dockerfile: ./docker/worker/Dockerfile
+    restart: always
+    volumes:
+      - ./backend:/app
+    env_file:
+      - ./.env
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - redis
+      - db
+    networks:
+      - app-network
+
+  # Celery beat para tareas programadas
+  celery-beat:
+    build:
+      context: .
+      dockerfile: ./docker/beat/Dockerfile
+    restart: always
+    volumes:
+      - ./backend:/app
+      - celery_beat_data:/app/celerybeat
+    env_file:
+      - ./.env
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - redis
+      - db
+      - celery-worker
+    networks:
+      - app-network
+
+  # Flower para monitoreo de Celery (versión simplificada que no depende de la configuración completa)
+  flower:
+    image: mher/flower:0.9.7
+    restart: always
+    ports:
+      - "5555:5555"
+    command: ["flower", "--broker=redis://redis:6379/0", "--port=5555"]
+    depends_on:
+      - redis
+      - celery-worker
     networks:
       - app-network
 
@@ -73,6 +126,7 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  celery_beat_data:
 
 networks:
   app-network:

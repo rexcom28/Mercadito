@@ -12,11 +12,11 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
-COPY requirements.txt /app/
+COPY ./backend/requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
-COPY . /app/
+COPY ./backend /app/
 
 # Create static directory and download Swagger UI
 RUN mkdir -p /app/static
@@ -27,5 +27,10 @@ RUN mkdir -p /app/media
 
 EXPOSE 8000
 
-# Run the application
+# Set environment variables
+ENV PYTHONPATH=/app
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# Run the API
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

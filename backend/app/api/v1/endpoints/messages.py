@@ -8,6 +8,7 @@ from app.schemas.message import MessageCreate, MessageResponse
 from app.models.message import Message
 from app.models.user import User
 from app.websockets.connection import manager
+from app.tasks.notifications import send_notification
 
 router = APIRouter()
 
@@ -17,7 +18,6 @@ async def create_message(
     db: Session = Depends(deps.get_db),
     message_in: MessageCreate,
     current_user: User = Depends(deps.get_current_user),
-    background_tasks: BackgroundTasks,
 ) -> Any:
     """
     Enviar un mensaje a otro usuario.
@@ -49,48 +49,30 @@ async def create_message(
     db.commit()
     db.refresh(db_message)
     
-    # Notificar al destinatario a través de WebSockets
-    background_tasks.add_task(
-        notify_new_message,
-        db_message.id,
-        current_user.id,
-        current_user.full_name,
+    # Notificar al destinatario usando Celery en lugar de background_tasks
+    notification_data = {
+        "type": "message",
+        "action": "created",
+        "data": {
+            "id": db_message.id,
+            "sender_id": current_user.id,
+            "sender_name": current_user.full_name,
+            "content": db_message.content,
+            "related_product_id": db_message.related_product_id,
+            "created_at": db_message.created_at.isoformat(),
+            "is_read": False,
+        }
+    }
+    
+    # Usar .delay() para enviar la tarea a Celery
+    send_notification.delay(
         message_in.recipient_id,
-        db_message.content,
-        db_message.related_product_id,
-        db_message.created_at.isoformat(),
+        "message", 
+        "created", 
+        notification_data["data"]
     )
     
     return db_message
-
-async def notify_new_message(
-    message_id: str,
-    sender_id: str,
-    sender_name: str,
-    recipient_id: str,
-    content: str,
-    related_product_id: Optional[str],
-    created_at: str,
-):
-    """
-    Función de notificación para nuevos mensajes.
-    """
-    await manager.send_personal_message(
-        {
-            "type": "message",
-            "action": "created",
-            "data": {
-                "id": message_id,
-                "sender_id": sender_id,
-                "sender_name": sender_name,
-                "content": content,
-                "related_product_id": related_product_id,
-                "created_at": created_at,
-                "is_read": False,
-            }
-        },
-        recipient_id
-    )
 
 @router.get("/", response_model=List[MessageResponse])
 def get_messages(
